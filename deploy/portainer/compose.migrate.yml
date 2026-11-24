@@ -1,0 +1,34 @@
+name: salomon-intra-migrate
+
+services:
+  migrate:
+    image: ${INTRA_API_IMAGE:?Set the same reviewed immutable image as the API}
+    restart: "no"
+    environment:
+      SPRING_PROFILES_ACTIVE: migrate
+      DB_HOST: aleph-postgres
+      DB_PORT: "5432"
+      SPRING_CONFIG_IMPORT: configtree:/run/secrets/
+    secrets:
+      - source: migration_password
+        target: DB_MIGRATION_PASSWORD
+    networks:
+      - database
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 384m
+    cpus: 0.5
+
+networks:
+  database:
+    external: true
+    name: aleph_network
+
+secrets:
+  migration_password:
+    file: ${INTRA_MIGRATION_PASSWORD_FILE:?Set an absolute VPS secret-file path}

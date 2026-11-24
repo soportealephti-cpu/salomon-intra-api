@@ -1,0 +1,12 @@
+/target/
+/.idea/
+/.settings/
+/.classpath
+/.project
+*.iml
+.env
+.env.*
+!.env.example
+*.log
+/secrets/
+*.secret
