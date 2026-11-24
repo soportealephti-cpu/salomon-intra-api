@@ -1,0 +1,15 @@
+spring:
+  main:
+    web-application-type: none
+  datasource:
+    username: ${DB_MIGRATION_USERNAME:salomon_intra_migrator}
+    password: ${DB_MIGRATION_PASSWORD}
+  flyway:
+    enabled: true
+    default-schema: flyway
+    schemas: flyway
+    create-schemas: false
+    locations: classpath:db/migration
+    clean-disabled: true
+    baseline-on-migrate: false
+    validate-on-migrate: true

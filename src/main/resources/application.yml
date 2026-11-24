@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: salomon-intra-api
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:aleph-postgres}:${DB_PORT:5432}/salomon_intra?currentSchema=intra&connectTimeout=5&socketTimeout=10
+    username: ${DB_USERNAME:salomon_intra_app}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:5}
+      minimum-idle: 1
+      connection-timeout: 5000
+      validation-timeout: 3000
+      initialization-fail-timeout: 10000
+  sql:
+    init:
+      mode: never
+  flyway:
+    enabled: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  forward-headers-strategy: framework
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      show-components: never
+      group:
+        database:
+          include: db
+        readiness:
+          include: readinessState,db
+      probes:
+        enabled: true
