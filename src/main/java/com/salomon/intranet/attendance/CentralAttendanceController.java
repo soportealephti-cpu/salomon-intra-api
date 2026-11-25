@@ -75,6 +75,18 @@ public class CentralAttendanceController {
         return changed>0 || owns(serial,pin);
     }
 
+    /** Live registry lookup: inactive or absent devices are not authorized. */
+    @GetMapping("/device-active")
+    public boolean deviceActive(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+                                @RequestParam String serial) {
+        authorize(supplied);
+        if(!serial.matches("[A-Za-z0-9_-]{4,64}"))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Serie inválida");
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+            "SELECT EXISTS(SELECT 1 FROM intra.biometric_devices WHERE serial_number=? AND active)",
+            Boolean.class,serial));
+    }
+
     private long device(String serial) {
         var ids=jdbc.query("SELECT id FROM intra.biometric_devices WHERE serial_number=? AND active",(rs,i)->rs.getLong(1),serial);
         if(ids.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Equipo no registrado");
