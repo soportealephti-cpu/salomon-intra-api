@@ -32,7 +32,9 @@ public class AdmsUserProvisionService {
 
     public record ProvisionStatus(long id, long employeeId, long deviceId, String pin,
                                   String status, Integer resultCode) {}
-    public record ProvisionRequest(long deviceId) {}
+    public record ProvisionRequest(long deviceId, String expectedOldPin) {
+        public ProvisionRequest(long deviceId) { this(deviceId, null); }
+    }
     private record Payload(long id, long deviceId, long employeeId, String pin, String name) {}
 
     @Transactional
@@ -43,7 +45,7 @@ public class AdmsUserProvisionService {
         }
         List<String[]> workers = jdbc.query("""
             SELECT full_name, dni FROM intra.attendance_employees
-            WHERE id=? AND active=true
+            WHERE id=? AND active=true AND archived_at IS NULL FOR UPDATE
             """, ps -> ps.setLong(1, employeeId),
             (rs,i)->new String[]{rs.getString(1), rs.getString(2)});
         if (workers.isEmpty()) {
@@ -81,14 +83,45 @@ public class AdmsUserProvisionService {
         if ((collision != null && collision > 0) || (queuedCollision != null && queuedCollision > 0)) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "Ese PIN ya está asignado a otro trabajador");
         }
-        Integer existing = jdbc.queryForObject("""
-            SELECT count(*) FROM intra.attendance_employee_device_ids
-            WHERE device_id=? AND employee_id=? AND device_user_id<>?
-            """, Integer.class, request.deviceId(), employeeId, pin);
-        if (existing != null && existing > 0) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
-                "Ese trabajador ya tiene otro PIN asignado en el dispositivo; edítalo antes de reenviar");
+        // A repeat click must not create a duplicate or hide a pending command.
+        var open = jdbc.query("""
+            SELECT id,employee_id,device_id,device_user_id,status,result_code
+            FROM intra.biometric_user_provision_commands
+            WHERE employee_id=? AND device_id=? AND status IN ('pending','sent')
+            ORDER BY id DESC LIMIT 1
+            """, (rs,i)->new ProvisionStatus(rs.getLong(1),rs.getLong(2),rs.getLong(3),
+                rs.getString(4),rs.getString(5),rs.getObject(6,Integer.class)),
+            employeeId,request.deviceId());
+        if(!open.isEmpty() && !pin.equals(open.get(0).pin()))
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"Existe una orden para otro PIN; consulta su estado");
+        if(Boolean.TRUE.equals(jdbc.queryForObject("""
+            SELECT EXISTS(SELECT 1 FROM intra.device_removal_commands
+            WHERE employee_id=? AND device_id=? AND status IN ('pending','sent'))
+            """,Boolean.class,employeeId,request.deviceId())))
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"Hay una eliminación pendiente");
+        var previous = jdbc.query("""
+            SELECT device_user_id FROM intra.attendance_employee_device_ids
+            WHERE device_id=? AND employee_id=? AND device_user_id<>? FOR UPDATE
+            """,(rs,i)->rs.getString(1),request.deviceId(),employeeId,pin);
+        if(!previous.isEmpty()) {
+            String oldPin=previous.get(0);
+            if(!oldPin.equals(request.expectedOldPin()))
+                throw new ResponseStatusException(HttpStatus.PRECONDITION_FAILED,"Confirma que eliminaste el PIN anterior del reloj");
+            // Attendance uses the device/PIN link for historical attribution. Never unlink history.
+            if(Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM intra.biometric_attendance_events
+                WHERE device_id=? AND device_user_id=?)
+                """,Boolean.class,request.deviceId(),oldPin)))
+                throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,"El PIN anterior tiene marcaciones históricas");
+            int removed=jdbc.update("""
+                DELETE FROM intra.attendance_employee_device_ids m
+                WHERE m.employee_id=? AND m.device_id=? AND m.device_user_id=?
+                AND NOT EXISTS(SELECT 1 FROM intra.biometric_attendance_events e
+                  WHERE e.device_id=m.device_id AND e.device_user_id=m.device_user_id)
+                """,employeeId,request.deviceId(),oldPin);
+            if(removed!=1)throw new ResponseStatusException(HttpStatus.CONFLICT,"La vinculación cambió; actualiza la lista");
         }
+        if(!open.isEmpty())return open.get(0);
         try {
             Long id = jdbc.queryForObject("""
                 INSERT INTO intra.biometric_user_provision_commands
