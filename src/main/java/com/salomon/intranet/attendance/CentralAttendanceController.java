@@ -15,9 +15,11 @@ public class CentralAttendanceController {
     private final JdbcTemplate jdbc;
     private final AdmsAttendanceService attendance;
     private final String token;
-    public CentralAttendanceController(JdbcTemplate jdbc, AdmsAttendanceService attendance,
+    private final AdmsUserProvisionService provision;
+    private final AdmsUserSyncService sync;
+    public CentralAttendanceController(JdbcTemplate jdbc, AdmsAttendanceService attendance, AdmsUserProvisionService provision, AdmsUserSyncService sync,
         @Value("${MARCACIONES_CENTRAL_TOKEN:}") String token) {
-        this.jdbc=jdbc; this.attendance=attendance; this.token=token;
+        this.jdbc=jdbc; this.attendance=attendance; this.token=token; this.provision=provision; this.sync=sync;
     }
     private void authorize(String supplied) {
         if(token.isBlank() || supplied==null || !MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8),supplied.getBytes(StandardCharsets.UTF_8)))
@@ -28,7 +30,7 @@ public class CentralAttendanceController {
             SELECT EXISTS(SELECT 1 FROM intra.attendance_employee_device_ids x
             JOIN intra.biometric_devices d ON d.id=x.device_id
             JOIN intra.attendance_employees e ON e.id=x.employee_id
-            WHERE d.serial_number=? AND d.active AND x.device_user_id=? AND e.active)
+            WHERE d.serial_number=? AND d.active AND x.device_user_id=? AND e.active AND e.archived_at IS NULL)
             """,Boolean.class,serial,pin));
     }
     @GetMapping("/owner")
@@ -44,5 +46,77 @@ public class CentralAttendanceController {
         var punches=AdmsAttendanceService.parse(body);
         for(var punch:punches) if(!owns(serial,punch.pin())) throw new ResponseStatusException(HttpStatus.CONFLICT,"PIN no vinculado");
         return attendance.receive(serial,body);
+    }
+
+    @GetMapping("/claimed")
+    public boolean claimed(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+        @RequestParam String serial,@RequestParam String pin) {
+        authorize(supplied);
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+          SELECT EXISTS(SELECT 1 FROM intra.attendance_employees WHERE dni=?
+          UNION ALL SELECT 1 FROM intra.attendance_employee_device_ids x JOIN intra.biometric_devices d ON d.id=x.device_id WHERE d.serial_number=? AND x.device_user_id=?
+          UNION ALL SELECT 1 FROM intra.biometric_device_admins a JOIN intra.biometric_devices d ON d.id=a.device_id WHERE d.serial_number=? AND a.pin=?)
+          """,Boolean.class,pin,serial,pin,serial,pin));
+    }
+    @PostMapping("/sync-pin")
+    @org.springframework.transaction.annotation.Transactional
+    public boolean syncPin(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+        @RequestParam String serial,@RequestParam String pin) {
+        authorize(supplied);
+        int changed=jdbc.update("""
+          INSERT INTO intra.attendance_employee_device_ids(employee_id,device_id,device_user_id)
+          SELECT e.id,d.id,? FROM intra.attendance_employees e CROSS JOIN intra.biometric_devices d
+          WHERE e.dni=? AND e.active AND e.archived_at IS NULL AND d.serial_number=? AND d.active
+          AND NOT EXISTS(SELECT 1 FROM intra.biometric_device_admins a WHERE a.device_id=d.id AND a.pin=?)
+          ON CONFLICT DO NOTHING
+          """,pin,pin,serial,pin);
+        return changed>0 || owns(serial,pin);
+    }
+
+    private long device(String serial) {
+        var ids=jdbc.query("SELECT id FROM intra.biometric_devices WHERE serial_number=? AND active",(rs,i)->rs.getLong(1),serial);
+        if(ids.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Equipo no registrado");
+        return ids.get(0);
+    }
+    @PostMapping("/contact")
+    public void contact(@RequestHeader(value="X-Central-Token",required=false) String supplied,@RequestParam String serial) {
+        authorize(supplied); device(serial);
+        jdbc.update("""
+          INSERT INTO intra.biometric_device_contacts(serial_number,last_endpoint) VALUES(?,'central')
+          ON CONFLICT(serial_number) DO UPDATE SET last_seen_at=now(),last_endpoint='central',contact_count=intra.biometric_device_contacts.contact_count+1
+          """,serial);
+    }
+    @PostMapping(value="/poll",produces=MediaType.TEXT_PLAIN_VALUE)
+    @org.springframework.transaction.annotation.Transactional
+    public String poll(@RequestHeader(value="X-Central-Token",required=false) String supplied,@RequestParam String serial) {
+        authorize(supplied);
+        long id=device(serial);
+        // Shared clock: only ordinary worker provisioning and read-only directory queries.
+        String command=provision.nextCommand(id);
+        if(command!=null) return command;
+        var rows=jdbc.query("""
+          UPDATE intra.biometric_user_sync_commands c SET status='sent',sent_at=now()
+          WHERE id=(SELECT id FROM intra.biometric_user_sync_commands WHERE device_id=?
+          AND created_at>now()-interval '10 minutes'
+          AND (status='pending' OR (status='sent' AND sent_at<now()-interval '30 seconds'))
+          ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING c.id
+          """,(rs,i)->rs.getLong(1),id);
+        return rows.isEmpty()?"OK\n":"C:"+rows.get(0)+":DATA QUERY USERINFO\n";
+    }
+    @PostMapping(value="/confirm",produces=MediaType.TEXT_PLAIN_VALUE)
+    public String confirm(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+         @RequestParam String serial,@RequestParam long id,@RequestParam int result) {
+        authorize(supplied); return sync.confirm(serial,id,result,"");
+    }
+    @GetMapping("/eligible")
+    public boolean eligible(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+        @RequestParam String serial,@RequestParam String pin) {
+        authorize(supplied);
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+          SELECT EXISTS(SELECT 1 FROM intra.attendance_employees e CROSS JOIN intra.biometric_devices d
+          WHERE e.dni=? AND e.active AND e.archived_at IS NULL AND d.serial_number=? AND d.active
+          AND NOT EXISTS(SELECT 1 FROM intra.biometric_device_admins a WHERE a.device_id=d.id AND a.pin=?)
+          AND NOT EXISTS(SELECT 1 FROM intra.attendance_employee_device_ids m WHERE m.device_id=d.id AND m.device_user_id=? AND m.employee_id<>e.id))
+          """,Boolean.class,pin,serial,pin,pin));
     }
 }

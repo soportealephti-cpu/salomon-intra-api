@@ -21,6 +21,8 @@ import java.util.List;
 /** Receptor ADMS y diagnostico de dispositivos. */
 @RestController
 public class AdmsDiagnosticController {
+    @org.springframework.beans.factory.annotation.Value("${MARCACIONES_CENTRAL_ENABLED:false}")
+    private boolean centralEnabled;
     private final JdbcTemplate jdbc;
     private final StaffAuthController auth;
     private final AdmsUserSyncService userSync;
@@ -69,6 +71,7 @@ public class AdmsDiagnosticController {
     }
 
     private void verifyAndRecord(String sn, String endpoint) {
+        if (centralEnabled) throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Usar API central de marcaciones");
         if (sn == null || sn.length() > 64 || !sn.matches("[A-Za-z0-9_-]{4,64}")) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Dispositivo no registrado");
         }

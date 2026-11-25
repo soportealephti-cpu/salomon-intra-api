@@ -13,6 +13,8 @@ services:
     restart: unless-stopped
     environment:
       SERVER_PORT: "8080"
+      MARCACIONES_CENTRAL_TOKEN: ${MARCACIONES_CENTRAL_TOKEN:-}
+      MARCACIONES_CENTRAL_ENABLED: ${MARCACIONES_CENTRAL_ENABLED:-false}
       DB_HOST: aleph-postgres
       DB_PORT: "5432"
       DB_USERNAME: salomon_intra_app
@@ -28,6 +30,8 @@ services:
       - "8080"
     networks:
       database:
+        aliases:
+          - salomon-intra-api
       application:
         aliases:
           - salomon-intra-api
