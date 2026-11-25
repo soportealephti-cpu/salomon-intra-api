@@ -60,6 +60,32 @@ public class CentralAttendanceController {
           UNION ALL SELECT 1 FROM intra.biometric_device_admins a JOIN intra.biometric_devices d ON d.id=a.device_id WHERE d.serial_number=? AND a.pin=?)
           """,Boolean.class,pin,serial,pin,serial,pin));
     }
+    // A former employee with the same DNI is historical ownership, not a current reservation.
+    // Never relax the separate /claimed check for administrator creation or deletion.
+    @GetMapping("/worker-conflict")
+    public boolean workerConflict(@RequestHeader(value="X-Central-Token",required=false) String supplied,
+        @RequestParam String serial,@RequestParam String pin,
+        @RequestParam(required=false) @org.springframework.format.annotation.DateTimeFormat(iso=org.springframework.format.annotation.DateTimeFormat.ISO.DATE_TIME) java.time.OffsetDateTime punchedAt) {
+        authorize(supplied);
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+          SELECT EXISTS(
+            SELECT 1 FROM intra.attendance_employees e WHERE e.dni=?
+              AND ((e.active AND e.archived_at IS NULL)
+                OR (CAST(? AS timestamptz) IS NOT NULL AND CAST(? AS timestamptz)<=COALESCE(e.archived_at,e.updated_at)))
+            UNION ALL
+            SELECT 1 FROM intra.attendance_employee_device_ids x
+              JOIN intra.biometric_devices d ON d.id=x.device_id
+              JOIN intra.attendance_employees e ON e.id=x.employee_id
+              WHERE d.serial_number=? AND x.device_user_id=?
+                AND (e.dni IS DISTINCT FROM ? OR (e.active AND e.archived_at IS NULL)
+                  OR (CAST(? AS timestamptz) IS NOT NULL AND CAST(? AS timestamptz)<=COALESCE(e.archived_at,e.updated_at)))
+            UNION ALL
+            SELECT 1 FROM intra.biometric_device_admins a JOIN intra.biometric_devices d ON d.id=a.device_id
+              WHERE d.serial_number=? AND a.pin=?
+          )
+          """,Boolean.class,pin,punchedAt,punchedAt,serial,pin,pin,punchedAt,punchedAt,serial,pin));
+    }
+
     @PostMapping("/sync-pin")
     @org.springframework.transaction.annotation.Transactional
     public boolean syncPin(@RequestHeader(value="X-Central-Token",required=false) String supplied,
