@@ -207,8 +207,8 @@ public class AttendanceController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Datos de corrección inválidos");
         }
         boolean reception = "RECEPCION".equals(viewer.role());
-        if (reception && (!input.date().equals(LocalDate.now(LIMA)) || !input.field().startsWith("LUNCH_"))) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica el almuerzo del día");
+        if (reception && !input.date().equals(LocalDate.now(LIMA))) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica las horas del día actual");
         }
         final LocalTime time;
         try { time = LocalTime.parse(input.time()); }
@@ -217,9 +217,6 @@ public class AttendanceController {
         }
         if (input.date().equals(LocalDate.now(LIMA)) && time.isAfter(LocalTime.now(LIMA))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"No se puede registrar una hora futura");
-        }
-        if (reception && (time.isBefore(LocalTime.of(12,0)) || time.isAfter(LocalTime.of(15,0)))) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"El almuerzo debe estar entre 12:00 y 15:00");
         }
         var locked = jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active FOR UPDATE",
             (rs,i)->rs.getLong(1), input.employeeId());
@@ -233,12 +230,6 @@ public class AttendanceController {
             case "LUNCH_OUT" -> times.lunchOutTime();
             default -> times.lunchReturnTime();
         };
-        var original = DailyAttendanceRules.classify(row.punches().stream().map(DailyPunch::time).toList());
-        String reference = reception ? (input.field().equals("LUNCH_OUT") ? original.lunchOutTime() : original.lunchReturnTime()) : previous;
-        if (reception && reference != null &&
-            Math.abs(java.time.Duration.between(LocalTime.parse(reference),time).toSeconds()) > 1800) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Recepción puede ajustar una hora existente hasta 30 minutos");
-        }
         String next = time.toString();
         String entry = input.field().equals("ENTRY") ? next : times.entryTime();
         String exit = input.field().equals("EXIT") ? next : times.exitTime();
