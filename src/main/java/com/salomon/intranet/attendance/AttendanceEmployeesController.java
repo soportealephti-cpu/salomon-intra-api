@@ -125,6 +125,11 @@ public class AttendanceEmployeesController {
                            @RequestBody Input input) {
         requireSA(authorization);
         validate(input);
+        if(input.active()==null || input.active()) {
+            jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? FOR UPDATE",(rs,i)->rs.getLong(1),id);
+            if(Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM intra.device_removal_commands WHERE employee_id=? AND status IN ('pending','sent'))",Boolean.class,id)))
+                throw new ResponseStatusException(HttpStatus.CONFLICT,"Hay una eliminación del reloj pendiente; espera su confirmación");
+        }
         if (input.dni() == null || !input.dni().trim().matches("[0-9]{8}")) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "DNI obligatorio");
         }
