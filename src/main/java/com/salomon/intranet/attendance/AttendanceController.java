@@ -38,7 +38,7 @@ public class AttendanceController {
     public record AttendanceRow(long userId, String employeeCode, String fullName,
                                 String area, String company, String dni,
                                 List<DailyPunch> punches,
-                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations) {}
+                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations, List<ManualAdjustment> adjustmentHistory) {}
     public record UnlinkedPunch(String deviceName, String deviceUserId,
                                 String time, String verifyMode) {}
     public record AttendanceKpis(int totalUsers, int withPunches,
@@ -72,7 +72,7 @@ public class AttendanceController {
             """, (rs, i) -> new AttendanceRow(
                 rs.getLong("id"), rs.getString("employee_code"), rs.getString("full_name"),
                 rs.getString("area"), rs.getString("company"), rs.getString("dni"),
-                new java.util.ArrayList<>(), null, Map.of(), Map.of()));
+                new java.util.ArrayList<>(), null, Map.of(), Map.of(), List.of()));
 
         // Compare local time to local day. No shifting due to database/server time zone.
         var punches = jdbc.query("""
@@ -112,18 +112,28 @@ public class AttendanceController {
             saved++;
         }
         Map<Long, Map<String, ManualAdjustment>> manual = new HashMap<>();
+        Map<Long,List<ManualAdjustment>> history=new HashMap<>();
+        Map<Long,Map<String,String>> legacySources=new HashMap<>();
         jdbc.query("""
-            SELECT DISTINCT ON (employee_id, field) employee_id, field,
+            SELECT employee_id,field,action,to_char(source_time,'HH24:MI:SS') AS source_time,
               to_char(corrected_time,'HH24:MI:SS') AS corrected_time,
               to_char(previous_time,'HH24:MI:SS') AS previous_time,
               reason, actor_username, actor_role, created_at::text AS created_at
             FROM intra.attendance_manual_adjustments WHERE work_date=?
-            ORDER BY employee_id,field,id DESC
+            ORDER BY id
             """, rs -> {
-                manual.computeIfAbsent(rs.getLong("employee_id"), k -> new HashMap<>())
-                    .put(rs.getString("field"), new ManualAdjustment(rs.getString("corrected_time"),
-                        rs.getString("previous_time"), rs.getString("reason"), rs.getString("actor_username"),
-                        rs.getString("actor_role"), rs.getString("created_at")));
+                long employee=rs.getLong("employee_id");
+                String field=rs.getString("field"),action=rs.getString("action"),source=rs.getString("source_time");
+                if("LEGACY".equals(action)){
+                    var first=legacySources.computeIfAbsent(employee,k->new HashMap<>());
+                    if(!first.containsKey(field))first.put(field,rs.getString("previous_time"));
+                    source=first.get(field);
+                }
+                var adjustment=new ManualAdjustment(rs.getString("corrected_time"),rs.getString("previous_time"),
+                    rs.getString("reason"),rs.getString("actor_username"),rs.getString("actor_role"),
+                    rs.getString("created_at"),field,action,source);
+                manual.computeIfAbsent(employee,k->new HashMap<>()).put(field,adjustment);
+                history.computeIfAbsent(employee,k->new java.util.ArrayList<>()).add(adjustment);
             }, day);
         Map<Long, Map<Integer, Observation>> observations = new HashMap<>();
         jdbc.query("""
@@ -138,16 +148,12 @@ public class AttendanceController {
             }, day);
         employees = employees.stream().map(e -> {
             var adjustments = manual.getOrDefault(e.userId(), Map.of());
-            var original = DailyAttendanceRules.classify(e.punches().stream().map(DailyPunch::time).toList());
+            var changes=history.getOrDefault(e.userId(),List.of());
+            var resolved=resolve(day,e.punches(),adjustments,changes);
             return new AttendanceRow(e.userId(), e.employeeCode(), e.fullName(), e.area(), e.company(), e.dni(),
-                e.punches(), new DailyAttendanceRules.Times(
-                    effective(adjustments,"ENTRY",original.entryTime()),
-                    effective(adjustments,"EXIT",original.exitTime()),
-                    effective(adjustments,"LUNCH_OUT",original.lunchOutTime()),
-                    effective(adjustments,"LUNCH_RETURN",original.lunchReturnTime())
-                ), adjustments, observations.getOrDefault(e.userId(), Map.of()));
+                e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes);
         }).toList();
-        int withPunches = (int) employees.stream().filter(e -> !e.punches().isEmpty() || !e.adjustments().isEmpty()).count();
+        int withPunches = (int) employees.stream().filter(e -> !e.punches().isEmpty() || e.times().entryTime()!=null || e.times().exitTime()!=null || e.times().lunchOutTime()!=null || e.times().lunchReturnTime()!=null).count();
         return new AttendanceResponse(day,
             new AttendanceKpis(employees.size(), withPunches, saved,
                 employees.size() - withPunches), employees, unlinked);
@@ -184,8 +190,30 @@ public class AttendanceController {
     }
 
     public record ManualAdjustment(String time, String previousTime, String reason,
-                                   String actor, String role, String createdAt) {}
-    public record AdjustmentInput(long employeeId, LocalDate date, String field, String time, String reason) {}
+                                   String actor, String role, String createdAt,String field,String action,String sourceTime) {}
+    public record AdjustmentInput(long employeeId, LocalDate date, String field, String time, String reason,String action) {}
+
+    private static DailyAttendanceRules.Times resolve(LocalDate day,List<DailyPunch> punches,Map<String,ManualAdjustment> adjustments,List<ManualAdjustment> history){
+        var raw=punches.stream().map(DailyPunch::time).toList();
+        if(day.isBefore(DailyAttendanceRules.SEQUENCE_FROM)){
+            var original=DailyAttendanceRules.legacyClassify(raw);
+            return new DailyAttendanceRules.Times(effective(adjustments,"ENTRY",original.entryTime()),effective(adjustments,"EXIT",original.exitTime()),
+                effective(adjustments,"LUNCH_OUT",original.lunchOutTime()),effective(adjustments,"LUNCH_RETURN",original.lunchReturnTime()));
+        }
+        Map<String,DailyAttendanceRules.Slot> slots=new HashMap<>();
+        adjustments.forEach((k,a)->slots.put(k,new DailyAttendanceRules.Slot(a.time(),a.sourceTime())));
+        var excluded=history.stream().filter(a->"CLEAR".equals(a.action())).map(ManualAdjustment::sourceTime).filter(java.util.Objects::nonNull).toList();
+        return DailyAttendanceRules.sequence(raw,slots,excluded);
+    }
+    private static void validateOrder(DailyAttendanceRules.Times times){
+        LocalTime prior=null;
+        for(String value:new String[]{times.entryTime(),times.lunchOutTime(),times.lunchReturnTime(),times.exitTime()}){
+            if(value==null)continue;
+            LocalTime current=LocalTime.parse(value);
+            if(prior!=null&&current.isBefore(prior))throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Las horas deben respetar el orden de la jornada");
+            prior=current;
+        }
+    }
 
     private static String effective(Map<String, ManualAdjustment> values, String key, String fallback) {
         return values.containsKey(key) ? values.get(key).time() : fallback;
@@ -200,7 +228,11 @@ public class AttendanceController {
         if (!java.util.Set.of("SA","ADMIN","RECEPCION").contains(viewer.role())) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN,"No puedes modificar asistencia");
         }
-        if (input == null || input.date() == null || input.field() == null || input.time() == null ||
+        String action=input==null||input.action()==null?"SET":input.action();
+        if (input == null || input.date() == null || input.field() == null ||
+            !java.util.Set.of("SET","FILL","CLEAR").contains(action) ||
+            (!"CLEAR".equals(action)&&input.time()==null) || ("CLEAR".equals(action)&&"ENTRY".equals(input.field())) ||
+            ("FILL".equals(action)&&input.date().isBefore(DailyAttendanceRules.SEQUENCE_FROM)) ||
             input.reason() == null || input.reason().trim().length() < 5 || input.reason().length() > 500 ||
             !java.util.Set.of("ENTRY","EXIT","LUNCH_OUT","LUNCH_RETURN").contains(input.field()) ||
             input.date().isBefore(LocalDate.of(2000,1,1)) || input.date().isAfter(LocalDate.now(LIMA))) {
@@ -211,11 +243,11 @@ public class AttendanceController {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica las horas del día actual");
         }
         final LocalTime time;
-        try { time = LocalTime.parse(input.time()); }
+        try { time = "CLEAR".equals(action)?null:LocalTime.parse(input.time()); }
         catch (java.time.DateTimeException ex) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Hora inválida");
         }
-        if (input.date().equals(LocalDate.now(LIMA)) && time.isAfter(LocalTime.now(LIMA))) {
+        if (time!=null && input.date().equals(LocalDate.now(LIMA)) && time.isAfter(LocalTime.now(LIMA))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"No se puede registrar una hora futura");
         }
         var locked = jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active FOR UPDATE",
@@ -230,26 +262,28 @@ public class AttendanceController {
             case "LUNCH_OUT" -> times.lunchOutTime();
             default -> times.lunchReturnTime();
         };
-        String next = time.toString();
-        String entry = input.field().equals("ENTRY") ? next : times.entryTime();
-        String exit = input.field().equals("EXIT") ? next : times.exitTime();
-        String out = input.field().equals("LUNCH_OUT") ? next : times.lunchOutTime();
-        String back = input.field().equals("LUNCH_RETURN") ? next : times.lunchReturnTime();
-        LocalTime prior = null;
-        for (String value : new String[]{entry,out,back,exit}) {
-            if (value==null) continue;
-            LocalTime current = LocalTime.parse(value);
-            if(prior!=null && current.isBefore(prior))
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Las horas deben respetar el orden de la jornada");
-            prior=current;
+        var current=row.adjustments().get(input.field());
+        String source=current==null||"CLEAR".equals(current.action())?previous:current.sourceTime();
+        if("FILL".equals(action)){
+            if(current!=null&&current.time()!=null)throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Ya existe un ajuste manual; corrige esa hora");
+            source=null;
+        } else if("CLEAR".equals(action)&&previous==null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"No hay una hora que restablecer");
         }
+        String next=time==null?null:time.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
+        Map<String,ManualAdjustment> projected=new HashMap<>(row.adjustments());
+        var change=new ManualAdjustment(next,previous,input.reason().trim(),viewer.username(),viewer.role(),"",input.field(),action,source);
+        projected.put(input.field(),change);
+        var changes=new java.util.ArrayList<>(row.adjustmentHistory());changes.add(change);
+        validateOrder(resolve(input.date(),row.punches(),projected,changes));
         jdbc.update("""
             INSERT INTO intra.attendance_manual_adjustments
-            (employee_id,work_date,field,previous_time,corrected_time,reason,actor_id,actor_username,actor_role)
-            VALUES (?,?,?,?,?,?,?,?,?)
+            (employee_id,work_date,field,previous_time,corrected_time,reason,actor_id,actor_username,actor_role,action,source_time)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,input.employeeId(),input.date(),input.field(),
-            previous == null ? null : java.sql.Time.valueOf(LocalTime.parse(previous)),
-            java.sql.Time.valueOf(time),input.reason().trim(),viewer.id(),viewer.username(),viewer.role());
+            previous==null?null:java.sql.Time.valueOf(LocalTime.parse(previous)),
+            time==null?null:java.sql.Time.valueOf(time),input.reason().trim(),viewer.id(),viewer.username(),viewer.role(),action,
+            source==null?null:java.sql.Time.valueOf(LocalTime.parse(source)));
         return Map.of("saved",true);
     }
 

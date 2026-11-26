@@ -32,7 +32,31 @@ class DailyAttendanceRulesTest {
     }
     @Test
     void singleLunchPunch() {
-        assertEquals(new DailyAttendanceRules.Times("08:00:00", "18:00:00", "12:30:00", null),
+        assertEquals(new DailyAttendanceRules.Times("08:00:00", null, "12:30:00", "18:00:00"),
             DailyAttendanceRules.classify(List.of("08:00:00", "12:30:00", "18:00:00")));
+    }
+
+    @Test void lateLunchAndExtraPunch(){
+        assertEquals(new DailyAttendanceRules.Times("08:00:00","18:00:00","13:00:00","16:00:00"),
+            DailyAttendanceRules.classify(List.of("08:00:00","13:00:00","16:00:00","18:00:00","18:05:00")));
+    }
+    @Test void manualMissingLunchAdvancesNextPunch(){
+        var slots=java.util.Map.of("LUNCH_OUT",new DailyAttendanceRules.Slot("12:30:00",null));
+        assertEquals(new DailyAttendanceRules.Times("08:00:00",null,"12:30:00","16:00:00"),
+            DailyAttendanceRules.sequence(List.of("08:00:00","16:00:00"),slots,List.of()));
+    }
+    @Test void correctingEntryConsumesOriginal(){
+        var slots=java.util.Map.of("ENTRY",new DailyAttendanceRules.Slot("08:00:00","09:00:00"));
+        assertEquals(new DailyAttendanceRules.Times("08:00:00",null,"12:00:00",null),
+            DailyAttendanceRules.sequence(List.of("09:00:00","12:00:00"),slots,List.of()));
+    }
+    @Test void resetExitAllowsNextPunch(){
+        var slots=java.util.Map.of("EXIT",new DailyAttendanceRules.Slot(null,"17:00:00"));
+        assertEquals(new DailyAttendanceRules.Times("08:00:00","18:00:00","12:00:00","16:00:00"),
+            DailyAttendanceRules.sequence(List.of("08:00:00","12:00:00","16:00:00","17:00:00","18:00:00"),slots,List.of("17:00:00")));
+    }
+    @Test void legacyHistoryKeepsOldClassification(){
+        assertEquals(new DailyAttendanceRules.Times("08:00:00","18:00:00","12:30:00",null),
+            DailyAttendanceRules.legacyClassify(List.of("08:00:00","12:30:00","18:00:00")));
     }
 }
