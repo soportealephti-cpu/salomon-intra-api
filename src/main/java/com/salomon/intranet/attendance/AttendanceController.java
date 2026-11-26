@@ -308,7 +308,11 @@ public class AttendanceController {
         }
         Map<String,DailyAttendanceRules.Slot> slots=new HashMap<>();
         adjustments.forEach((k,a)->slots.put(k,new DailyAttendanceRules.Slot(a.time(),a.sourceTime())));
-        var excluded=history.stream().filter(a->"CLEAR".equals(a.action())).map(ManualAdjustment::sourceTime).filter(java.util.Objects::nonNull).toList();
+        var excluded=history.stream().flatMap(a->{
+            if("MOVE_OUT".equals(a.action()))return java.util.stream.Stream.of(a.sourceTime(),a.previousTime());
+            if("CLEAR".equals(a.action()))return java.util.stream.Stream.of(a.sourceTime());
+            return java.util.stream.Stream.<String>empty();
+        }).filter(java.util.Objects::nonNull).toList();
         return DailyAttendanceRules.sequence(raw,slots,excluded);
     }
     private static void validateOrder(DailyAttendanceRules.Times times){
@@ -369,7 +373,7 @@ public class AttendanceController {
             default -> times.lunchReturnTime();
         };
         var current=row.adjustments().get(input.field());
-        String source=current==null||"CLEAR".equals(current.action())?previous:current.sourceTime();
+        String source=current==null||"CLEAR".equals(current.action())||"MOVE_OUT".equals(current.action())?previous:current.sourceTime();
         if("FILL".equals(action)){
             if(current!=null&&current.time()!=null)throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Ya existe un ajuste manual; corrige esa hora");
             source=null;
@@ -391,6 +395,83 @@ public class AttendanceController {
             time==null?null:java.sql.Time.valueOf(time),input.reason().trim(),viewer.id(),viewer.username(),viewer.role(),action,
             source==null?null:java.sql.Time.valueOf(LocalTime.parse(source)));
         return Map.of("saved",true);
+    }
+
+    public record ReorderInput(long employeeId,LocalDate date,String fromField,String toField,String expectedTime,String reason) {}
+
+    private static String slotTime(DailyAttendanceRules.Times times,String field){
+        return switch(field){
+            case "ENTRY" -> times.entryTime();
+            case "LUNCH_OUT" -> times.lunchOutTime();
+            case "LUNCH_RETURN" -> times.lunchReturnTime();
+            case "EXIT" -> times.exitTime();
+            default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Campo inválido");
+        };
+    }
+    private static String slotLabel(String field){
+        return switch(field){
+            case "ENTRY" -> "Entrada";
+            case "LUNCH_OUT" -> "Salida a almuerzo";
+            case "LUNCH_RETURN" -> "Regreso de almuerzo";
+            case "EXIT" -> "Salida del trabajo";
+            default -> field;
+        };
+    }
+    private static java.sql.Time sqlTime(String value){
+        return value==null?null:java.sql.Time.valueOf(LocalTime.parse(value));
+    }
+    /** Move a displayed time without deleting biometric records or overwriting another slot. */
+    @PostMapping("/reorder")
+    @Transactional
+    public Map<String,Object> reorder(
+        @RequestHeader(value="Authorization",required=false) String authorization,
+        @RequestBody ReorderInput input){
+        var viewer=auth.me(authorization);
+        if(!java.util.Set.of("SA","ADMIN","RECEPCION").contains(viewer.role()))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"No puedes modificar asistencia");
+        if(input==null||input.date()==null||input.employeeId()<1||input.fromField()==null||input.toField()==null||
+            !DailyAttendanceRules.ORDER.contains(input.fromField())||!DailyAttendanceRules.ORDER.contains(input.toField())||
+            input.fromField().equals(input.toField())||input.expectedTime()==null||input.reason()==null||
+            input.reason().strip().length()<5||input.reason().length()>350||
+            input.date().isBefore(LocalDate.of(2000,1,1))||input.date().isAfter(LocalDate.now(LIMA)))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Datos de reordenamiento inválidos");
+        if("RECEPCION".equals(viewer.role())&&!input.date().equals(LocalDate.now(LIMA)))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica el día actual");
+        LocalTime expected;
+        try{expected=LocalTime.parse(input.expectedTime());}
+        catch(java.time.DateTimeException ex){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Hora inválida");}
+        var locked=jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active AND archived_at IS NULL FOR UPDATE",
+            (rs,i)->rs.getLong(1),input.employeeId());
+        if(locked.isEmpty())throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Trabajador no encontrado");
+        var row=list(authorization,input.date()).users().stream().filter(e->e.userId()==input.employeeId()).findFirst().orElseThrow();
+        var times=row.times();
+        String value=slotTime(times,input.fromField());
+        if(value==null||!LocalTime.parse(value).equals(expected)||slotTime(times,input.toField())!=null)
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"La hora cambió o el destino ya tiene una hora. Actualiza el listado");
+        var current=row.adjustments().get(input.fromField());
+        String source=current==null||current.time()==null||current.sourceTime()==null?value:current.sourceTime();
+        String reason="Reordenado: "+slotLabel(input.fromField())+" → "+slotLabel(input.toField())+". "+input.reason().strip();
+        var out=new ManualAdjustment(null,value,reason,viewer.username(),viewer.role(),"",input.fromField(),"MOVE_OUT",source);
+        var in=new ManualAdjustment(value,null,reason,viewer.username(),viewer.role(),"",input.toField(),"MOVE_IN",null);
+        var projected=new HashMap<>(row.adjustments());
+        projected.put(input.fromField(),out);projected.put(input.toField(),in);
+        var history=new java.util.ArrayList<>(row.adjustmentHistory());history.add(out);history.add(in);
+        var result=resolve(input.date(),row.punches(),projected,history);
+        validateOrder(result);
+        for(String field:DailyAttendanceRules.ORDER){
+            String desired=field.equals(input.fromField())?null:field.equals(input.toField())?value:slotTime(times,field);
+            if(!java.util.Objects.equals(slotTime(result,field),desired))
+                throw new ResponseStatusException(HttpStatus.CONFLICT,"El movimiento cambiaría otras horas. Revisa las marcaciones y elige otro destino");
+        }
+        for(var change:java.util.List.of(out,in)){
+            jdbc.update("""
+                INSERT INTO intra.attendance_manual_adjustments
+                (employee_id,work_date,field,previous_time,corrected_time,reason,actor_id,actor_username,actor_role,action,source_time)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,input.employeeId(),input.date(),change.field(),sqlTime(change.previousTime()),sqlTime(change.time()),
+                change.reason(),viewer.id(),viewer.username(),viewer.role(),change.action(),sqlTime(change.sourceTime()));
+        }
+        return Map.of("saved",true,"times",result);
     }
 
     public record BiometricPunch(long id, String serialNumber, String deviceUserId,
