@@ -115,10 +115,25 @@ public class AccessAccountController {
         // Never silently detach a real worker or remove historical records.
         Boolean blocked=jdbc.queryForObject("""
           SELECT EXISTS(
-            SELECT 1 FROM intra.attendance_employee_device_ids WHERE employee_id=?
-            UNION ALL SELECT 1 FROM intra.attendance_employee_auth_methods WHERE employee_id=?
-            UNION ALL SELECT 1 FROM intra.biometric_user_provision_commands WHERE employee_id=?
-            UNION ALL SELECT 1 FROM intra.device_removal_commands WHERE employee_id=?
+            SELECT 1 FROM intra.attendance_employee_device_ids m
+              WHERE m.employee_id=? AND NOT EXISTS(
+                SELECT 1 FROM intra.device_removal_commands r
+                WHERE r.employee_id=m.employee_id AND r.device_id=m.device_id AND r.pin=m.device_user_id
+                  AND r.status='confirmed' AND r.result_code=0 AND r.completed_at IS NOT NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM intra.biometric_user_provision_commands q
+                    WHERE q.employee_id=m.employee_id AND q.device_id=m.device_id
+                      AND q.device_user_id=m.device_user_id AND q.status='confirmed'
+                      AND (q.completed_at IS NULL OR q.completed_at>=r.completed_at)))
+            UNION ALL SELECT 1 FROM intra.attendance_employee_auth_methods a WHERE a.employee_id=?
+              AND NOT EXISTS(SELECT 1 FROM intra.device_removal_commands r
+                WHERE r.employee_id=a.employee_id AND r.status='confirmed' AND r.result_code=0)
+            UNION ALL SELECT 1 FROM intra.biometric_user_provision_commands q WHERE q.employee_id=?
+              AND (q.status IN ('pending','sent') OR (q.status='confirmed' AND NOT EXISTS(
+                SELECT 1 FROM intra.device_removal_commands r
+                WHERE r.employee_id=q.employee_id AND r.device_id=q.device_id AND r.pin=q.device_user_id
+                  AND r.status='confirmed' AND r.result_code=0 AND r.completed_at>q.completed_at)))
+            UNION ALL SELECT 1 FROM intra.device_removal_commands WHERE employee_id=? AND status IN ('pending','sent')
             UNION ALL SELECT 1 FROM intra.attendance_manual_adjustments WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.attendance_observations WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.payroll_schedules WHERE employee_id=?
@@ -127,9 +142,11 @@ public class AccessAccountController {
             UNION ALL SELECT 1 FROM intra.biometric_attendance_events b
               JOIN intra.attendance_employees e ON e.id=?
               WHERE b.device_user_id=e.dni OR b.device_user_id=e.employee_code
+                 OR EXISTS(SELECT 1 FROM intra.attendance_employee_device_ids m
+                   WHERE m.employee_id=e.id AND m.device_id=b.device_id AND m.device_user_id=b.device_user_id)
           )
           """,Boolean.class,employee,employee,employee,employee,employee,employee,employee,employee,accountId,employee);
-        if(!Boolean.FALSE.equals(blocked))throw new ResponseStatusException(HttpStatus.CONFLICT,"Trabajador con marcaciones, vinculación biométrica, órdenes o historial de planilla; no se puede convertir automáticamente");
+        if(!Boolean.FALSE.equals(blocked))throw new ResponseStatusException(HttpStatus.CONFLICT,"Hay historial de asistencia/planilla, órdenes pendientes o vínculos sin eliminación confirmada por el reloj");
 
     }
 
