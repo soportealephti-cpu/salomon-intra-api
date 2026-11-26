@@ -101,6 +101,17 @@ public class AccessAccountController {
         var accounts=jdbc.query(SELECT+" WHERE u.id=? FOR UPDATE OF u",AccessAccountController::row,id);
         if(accounts.isEmpty()||!Long.valueOf(employee).equals(accounts.get(0).employeeId()))
             throw new ResponseStatusException(HttpStatus.CONFLICT,"La vinculación cambió");
+        requireNoWorkerHistory(employee,id);
+        // Keep the staff ID, credentials, sessions, role and all actor references.
+        if(jdbc.update("UPDATE intra.staff_users SET employee_id=NULL WHERE id=? AND employee_id=?",id,employee)!=1)
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"La vinculación cambió");
+        if(jdbc.update("UPDATE intra.attendance_employees SET active=false,archived_at=now(),updated_at=now() WHERE id=? AND archived_at IS NULL",employee)!=1)
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"El trabajador cambió");
+        jdbc.update("INSERT INTO intra.access_account_conversions(account_id,employee_id,actor_id,username) VALUES(?,?,?,?)",id,employee,actor.id(),accounts.get(0).username());
+        return Map.of("saved",true);
+    }
+
+    private void requireNoWorkerHistory(long employee,Long accountId){
         // Never silently detach a real worker or remove historical records.
         Boolean blocked=jdbc.queryForObject("""
           SELECT EXISTS(
@@ -117,14 +128,34 @@ public class AccessAccountController {
               JOIN intra.attendance_employees e ON e.id=?
               WHERE b.device_user_id=e.dni OR b.device_user_id=e.employee_code
           )
-          """,Boolean.class,employee,employee,employee,employee,employee,employee,employee,employee,id,employee);
+          """,Boolean.class,employee,employee,employee,employee,employee,employee,employee,employee,accountId,employee);
         if(!Boolean.FALSE.equals(blocked))throw new ResponseStatusException(HttpStatus.CONFLICT,"Trabajador con marcaciones, vinculación biométrica, órdenes o historial de planilla; no se puede convertir automáticamente");
-        // Keep the staff ID, credentials, sessions, role and all actor references.
-        if(jdbc.update("UPDATE intra.staff_users SET employee_id=NULL WHERE id=? AND employee_id=?",id,employee)!=1)
-            throw new ResponseStatusException(HttpStatus.CONFLICT,"La vinculación cambió");
+
+    }
+
+    public record NewConversion(Input account,String confirmation){}
+    @PostMapping("/from-worker/{employee}")
+    @Transactional
+    public Map<String,Boolean> convertWithoutAccount(@RequestHeader(value="Authorization",required=false) String token,@PathVariable long employee,@RequestBody NewConversion input){
+        var actor=requireSA(token);
+        if(input==null||!"CONVERTIR".equals(input.confirmation()))throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Confirmación requerida");
+        Input account=input.account();
+        String name=username(account,true);
+        var workers=jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND archived_at IS NULL FOR UPDATE",(r,i)->r.getLong(1),employee);
+        if(workers.isEmpty())throw new ResponseStatusException(HttpStatus.CONFLICT,"Trabajador no disponible");
+        if(!jdbc.query("SELECT id FROM intra.staff_users WHERE employee_id=? FOR UPDATE",(r,i)->r.getLong(1),employee).isEmpty())
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"Ya existe una cuenta vinculada; vuelve a abrir el formulario");
+        requireNoWorkerHistory(employee,null);
+        long id;
+        try{
+            id=jdbc.queryForObject("""
+              INSERT INTO intra.staff_users(username,display_name,role,password_hash,active,employee_id)
+              VALUES(?,?,?,?,?,NULL) RETURNING id
+              """,Long.class,name,account.displayName().strip(),account.role(),encoder.encode(account.password()),account.active());
+        }catch(DataIntegrityViolationException ex){throw new ResponseStatusException(HttpStatus.CONFLICT,"Usuario ya registrado");}
         if(jdbc.update("UPDATE intra.attendance_employees SET active=false,archived_at=now(),updated_at=now() WHERE id=? AND archived_at IS NULL",employee)!=1)
             throw new ResponseStatusException(HttpStatus.CONFLICT,"El trabajador cambió");
-        jdbc.update("INSERT INTO intra.access_account_conversions(account_id,employee_id,actor_id,username) VALUES(?,?,?,?)",id,employee,actor.id(),accounts.get(0).username());
+        jdbc.update("INSERT INTO intra.access_account_conversions(account_id,employee_id,actor_id,username) VALUES(?,?,?,?)",id,employee,actor.id(),name);
         return Map.of("saved",true);
     }
 }
