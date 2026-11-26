@@ -38,7 +38,7 @@ public class AttendanceController {
     public record AttendanceRow(long userId, String employeeCode, String fullName,
                                 String area, String company, String dni,
                                 List<DailyPunch> punches,
-                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations, List<ManualAdjustment> adjustmentHistory) {}
+                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations, List<ManualAdjustment> adjustmentHistory, Boolean late) {}
     public record UnlinkedPunch(String deviceName, String deviceUserId,
                                 String time, String verifyMode) {}
     public record AttendanceKpis(int totalUsers, int withPunches,
@@ -72,7 +72,7 @@ public class AttendanceController {
             """, (rs, i) -> new AttendanceRow(
                 rs.getLong("id"), rs.getString("employee_code"), rs.getString("full_name"),
                 rs.getString("area"), rs.getString("company"), rs.getString("dni"),
-                new java.util.ArrayList<>(), null, Map.of(), Map.of(), List.of()));
+                new java.util.ArrayList<>(), null, Map.of(), Map.of(), List.of(), null));
 
         // Compare local time to local day. No shifting due to database/server time zone.
         var punches = jdbc.query("""
@@ -146,12 +146,26 @@ public class AttendanceController {
                     .put(rs.getInt("slot"),new Observation(rs.getString("observation"),
                         rs.getString("actor_username"),rs.getString("created_at")));
             }, day);
+        // Use only effective schedules for this date. No invented default start time.
+        Map<Long,LocalTime> scheduledStarts=new HashMap<>();
+        jdbc.query("""
+            SELECT employee_id,starts_at,working FROM (
+                SELECT DISTINCT ON (employee_id) employee_id,starts_at,working
+                FROM intra.payroll_schedules
+                WHERE effective_from<=? AND weekday=?
+                ORDER BY employee_id,effective_from DESC
+            ) effective_schedule
+            """,rs->{
+                if(rs.getBoolean("working"))scheduledStarts.put(rs.getLong("employee_id"),rs.getObject("starts_at",LocalTime.class));
+            },day,day.getDayOfWeek().getValue());
         employees = employees.stream().map(e -> {
             var adjustments = manual.getOrDefault(e.userId(), Map.of());
             var changes=history.getOrDefault(e.userId(),List.of());
             var resolved=resolve(day,e.punches(),adjustments,changes);
+            var scheduled=scheduledStarts.get(e.userId());
+            Boolean late=scheduled==null||resolved.entryTime()==null?null:LocalTime.parse(resolved.entryTime()).isAfter(scheduled);
             return new AttendanceRow(e.userId(), e.employeeCode(), e.fullName(), e.area(), e.company(), e.dni(),
-                e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes);
+                e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes,late);
         }).toList();
         int withPunches = (int) employees.stream().filter(e -> !e.punches().isEmpty() || e.times().entryTime()!=null || e.times().exitTime()!=null || e.times().lunchOutTime()!=null || e.times().lunchReturnTime()!=null).count();
         return new AttendanceResponse(day,
