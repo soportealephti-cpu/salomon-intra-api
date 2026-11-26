@@ -136,6 +136,7 @@ public class AccessAccountController {
             UNION ALL SELECT 1 FROM intra.device_removal_commands WHERE employee_id=? AND status IN ('pending','sent')
             UNION ALL SELECT 1 FROM intra.attendance_manual_adjustments WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.attendance_observations WHERE employee_id=?
+            UNION ALL SELECT 1 FROM intra.attendance_outings WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.payroll_schedules WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.payroll_incidents WHERE employee_id=?
             UNION ALL SELECT 1 FROM intra.attendance_daily WHERE user_id=?
@@ -145,7 +146,7 @@ public class AccessAccountController {
                  OR EXISTS(SELECT 1 FROM intra.attendance_employee_device_ids m
                    WHERE m.employee_id=e.id AND m.device_id=b.device_id AND m.device_user_id=b.device_user_id)
           )
-          """,Boolean.class,employee,employee,employee,employee,employee,employee,employee,employee,accountId,employee);
+          """,Boolean.class,employee,employee,employee,employee,employee,employee,employee,employee,employee,accountId,employee);
         if(!Boolean.FALSE.equals(blocked))throw new ResponseStatusException(HttpStatus.CONFLICT,"Hay historial de asistencia/planilla, órdenes pendientes o vínculos sin eliminación confirmada por el reloj");
 
     }

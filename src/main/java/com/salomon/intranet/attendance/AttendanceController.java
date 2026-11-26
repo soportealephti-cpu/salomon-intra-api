@@ -38,7 +38,7 @@ public class AttendanceController {
     public record AttendanceRow(long userId, String employeeCode, String fullName,
                                 String area, String company, String dni,
                                 List<DailyPunch> punches,
-                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations, List<ManualAdjustment> adjustmentHistory, Boolean late) {}
+                                DailyAttendanceRules.Times times, Map<String, ManualAdjustment> adjustments, Map<Integer, Observation> observations, List<ManualAdjustment> adjustmentHistory, Boolean late, List<TemporaryOuting> outings) {}
     public record UnlinkedPunch(String deviceName, String deviceUserId,
                                 String time, String verifyMode) {}
     public record AttendanceKpis(int totalUsers, int withPunches,
@@ -72,7 +72,7 @@ public class AttendanceController {
             """, (rs, i) -> new AttendanceRow(
                 rs.getLong("id"), rs.getString("employee_code"), rs.getString("full_name"),
                 rs.getString("area"), rs.getString("company"), rs.getString("dni"),
-                new java.util.ArrayList<>(), null, Map.of(), Map.of(), List.of(), null));
+                new java.util.ArrayList<>(), null, Map.of(), Map.of(), List.of(), null, List.of()));
 
         // Compare local time to local day. No shifting due to database/server time zone.
         var punches = jdbc.query("""
@@ -158,6 +158,19 @@ public class AttendanceController {
             """,rs->{
                 if(rs.getBoolean("working"))scheduledStarts.put(rs.getLong("employee_id"),rs.getObject("starts_at",LocalTime.class));
             },day,day.getDayOfWeek().getValue());
+        Map<Long,List<TemporaryOuting>> outings=new HashMap<>();
+        jdbc.query("""
+            SELECT employee_id,id,to_char(departure,'HH24:MI:SS') AS departure,
+                   to_char(return_time,'HH24:MI:SS') AS return_time,observation,
+                   actor_username,created_at::text AS created_at,
+                   return_actor_username,returned_at::text AS returned_at,return_observation
+            FROM intra.attendance_outings WHERE work_date=? ORDER BY departure,id
+            """,rs->{
+                outings.computeIfAbsent(rs.getLong("employee_id"),k->new java.util.ArrayList<>())
+                    .add(new TemporaryOuting(rs.getLong("id"),rs.getString("departure"),rs.getString("return_time"),
+                        rs.getString("observation"),rs.getString("actor_username"),rs.getString("created_at"),
+                        rs.getString("return_actor_username"),rs.getString("returned_at"),rs.getString("return_observation")));
+            },day);
         employees = employees.stream().map(e -> {
             var adjustments = manual.getOrDefault(e.userId(), Map.of());
             var changes=history.getOrDefault(e.userId(),List.of());
@@ -165,12 +178,91 @@ public class AttendanceController {
             var scheduled=scheduledStarts.get(e.userId());
             Boolean late=scheduled==null||resolved.entryTime()==null?null:LocalTime.parse(resolved.entryTime()).isAfter(scheduled);
             return new AttendanceRow(e.userId(), e.employeeCode(), e.fullName(), e.area(), e.company(), e.dni(),
-                e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes,late);
+                e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes,late,outings.getOrDefault(e.userId(),List.of()));
         }).toList();
         int withPunches = (int) employees.stream().filter(e -> !e.punches().isEmpty() || e.times().entryTime()!=null || e.times().exitTime()!=null || e.times().lunchOutTime()!=null || e.times().lunchReturnTime()!=null).count();
         return new AttendanceResponse(day,
             new AttendanceKpis(employees.size(), withPunches, saved,
                 employees.size() - withPunches), employees, unlinked);
+    }
+
+    public record TemporaryOuting(long id,String departure,String returnTime,String observation,
+                                  String actor,String createdAt,String returnActor,String returnedAt,String returnObservation) {}
+    public record OutingInput(long employeeId,LocalDate date,Long outingId,String departure,
+                              String returnTime,String observation,String returnObservation) {}
+
+    /** Independent of the four biometric slots. A departure can be closed exactly once. */
+    @PostMapping("/outings")
+    @Transactional
+    public Map<String,Object> saveOuting(
+        @RequestHeader(value="Authorization",required=false) String authorization,
+        @RequestBody OutingInput input) {
+        var viewer=auth.me(authorization);
+        if(!java.util.Set.of("SA","ADMIN","RECEPCION").contains(viewer.role()))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"No autorizado a registrar salidas");
+        if(input==null||input.date()==null||input.employeeId()<1||
+            input.date().isBefore(LocalDate.of(2000,1,1))||input.date().isAfter(LocalDate.now(LIMA)))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Fecha o trabajador inválido");
+        if("RECEPCION".equals(viewer.role())&&!input.date().equals(LocalDate.now(LIMA)))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo registra salidas de hoy");
+        if(input.returnObservation()!=null&&input.returnObservation().length()>1000)
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Observación demasiado extensa");
+        var locked=jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active AND archived_at IS NULL FOR UPDATE",
+            (rs,i)->rs.getLong(1),input.employeeId());
+        if(locked.isEmpty())throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Trabajador no encontrado");
+        LocalTime back=parseOutingTime(input.returnTime(),input.date());
+        String returnNote=input.returnObservation()==null?"":input.returnObservation().strip();
+        if(input.outingId()!=null){
+            if(input.outingId()<1||back==null)
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Indica la hora de regreso");
+            var rows=jdbc.query("""
+                SELECT departure FROM intra.attendance_outings
+                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL
+                """,(rs,i)->rs.getObject(1,LocalTime.class),input.outingId(),input.employeeId(),input.date());
+            if(rows.isEmpty())throw new ResponseStatusException(HttpStatus.CONFLICT,"Salida no disponible o ya cerrada");
+            if(!back.isAfter(rows.getFirst()))throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"El regreso debe ser posterior a la salida");
+            if(jdbc.update("""
+                UPDATE intra.attendance_outings SET return_time=?,return_actor_id=?,return_actor_username=?,
+                    returned_at=now(),return_observation=?
+                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL
+                """,java.sql.Time.valueOf(back),viewer.id(),viewer.username(),returnNote,input.outingId(),input.employeeId(),input.date())!=1)
+                throw new ResponseStatusException(HttpStatus.CONFLICT,"La salida ya fue cerrada");
+            return Map.of("saved",true);
+        }
+        LocalTime departure=parseOutingTime(input.departure(),input.date());
+        if(departure==null||input.observation()==null||input.observation().strip().isEmpty()||input.observation().length()>1000||
+            (back!=null&&!back.isAfter(departure))||(back==null&&!returnNote.isEmpty()))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Indica salida, motivo y un regreso posterior, si corresponde");
+        var overlap=jdbc.queryForObject("""
+            SELECT EXISTS(SELECT 1 FROM intra.attendance_outings
+                WHERE employee_id=? AND work_date=?
+                  AND departure < COALESCE(CAST(? AS time),time '24:00')
+                  AND COALESCE(return_time,time '24:00') > CAST(? AS time))
+            """,Boolean.class,input.employeeId(),input.date(),back==null?null:java.sql.Time.valueOf(back),java.sql.Time.valueOf(departure));
+        if(Boolean.TRUE.equals(overlap))throw new ResponseStatusException(HttpStatus.CONFLICT,"Ya existe una salida que coincide con ese horario");
+        if(back==null){
+            jdbc.update("""
+                INSERT INTO intra.attendance_outings(employee_id,work_date,departure,observation,actor_id,actor_username)
+                VALUES (?,?,?,?,?,?)
+                """,input.employeeId(),input.date(),java.sql.Time.valueOf(departure),input.observation().strip(),viewer.id(),viewer.username());
+        }else{
+            jdbc.update("""
+                INSERT INTO intra.attendance_outings(employee_id,work_date,departure,observation,actor_id,actor_username,
+                    return_time,return_actor_id,return_actor_username,returned_at,return_observation)
+                VALUES (?,?,?,?,?,?,?,?,?,now(),?)
+                """,input.employeeId(),input.date(),java.sql.Time.valueOf(departure),input.observation().strip(),viewer.id(),viewer.username(),
+                java.sql.Time.valueOf(back),viewer.id(),viewer.username(),returnNote);
+        }
+        return Map.of("saved",true);
+    }
+    private static LocalTime parseOutingTime(String value,LocalDate day){
+        if(value==null||value.isBlank())return null;
+        LocalTime time;
+        try{time=LocalTime.parse(value).withNano(0);}
+        catch(java.time.DateTimeException ex){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Hora inválida");}
+        if(day.equals(LocalDate.now(LIMA))&&time.isAfter(LocalTime.now(LIMA)))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"No se puede registrar una hora futura");
+        return time;
     }
 
     public record Observation(String text, String actor, String createdAt) {}
@@ -186,7 +278,7 @@ public class AttendanceController {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN,"No autorizado a editar observaciones");
         }
         if (input == null || input.date() == null || input.text() == null ||
-            input.text().length() > 1000 || (input.slot() != 1 && input.slot() != 2) ||
+            input.text().length() > 1000 || (input.slot() != 1 && input.slot() != 2 && input.slot() != 3) ||
             input.date().isBefore(LocalDate.of(2000,1,1)) || input.date().isAfter(LocalDate.now(LIMA))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Observación inválida");
         }

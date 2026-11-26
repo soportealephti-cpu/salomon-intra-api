@@ -30,6 +30,7 @@ public class ArchivedEmployeesController {
             AND m.device_id=b.device_id AND m.device_user_id=b.device_user_id))
             OR EXISTS(SELECT 1 FROM intra.attendance_manual_adjustments a WHERE a.employee_id=e.id)
             OR EXISTS(SELECT 1 FROM intra.attendance_observations o WHERE o.employee_id=e.id)
+            OR EXISTS(SELECT 1 FROM intra.attendance_outings o WHERE o.employee_id=e.id)
             OR EXISTS(SELECT 1 FROM intra.payroll_incidents i WHERE i.employee_id=e.id)
             OR EXISTS(SELECT 1 FROM intra.payroll_schedules s WHERE s.employee_id=e.id)
             THEN 'Tiene historial de asistencia o planilla.'
@@ -104,6 +105,9 @@ public class ArchivedEmployeesController {
         return jdbc.queryForObject("""
             WITH u AS (SELECT id,role,active FROM intra.staff_users WHERE employee_id=?)
             SELECT CASE
+            WHEN EXISTS(SELECT 1 FROM intra.attendance_outings o WHERE o.employee_id=?
+                OR o.actor_id IN (SELECT id FROM u) OR o.return_actor_id IN (SELECT id FROM u))
+              THEN 'Tiene registros de salidas temporales o su auditoría; deben conservarse.'
             WHEN EXISTS(SELECT 1 FROM u WHERE active OR role='SA')
               THEN 'La cuenta vinculada está activa o tiene rol SA. No se puede eliminar desde la papelera.'
             WHEN EXISTS(SELECT 1 FROM intra.biometric_user_provision_commands WHERE employee_id=? AND status IN ('pending','sent'))
@@ -118,7 +122,7 @@ public class ArchivedEmployeesController {
               OR EXISTS(SELECT 1 FROM intra.biometric_device_admin_commands WHERE actor_id IN (SELECT id FROM u))
               THEN 'La cuenta figura como responsable de operaciones de otros trabajadores o administradores. Debe conservarse su auditoría.'
             ELSE NULL END
-            """,String.class,id,id,id,id,id,id,id,id);
+            """,String.class,id,id,id,id,id,id,id,id,id);
     }
     private DeletionPreview preview(long id) {
         var rows=jdbc.query("SELECT full_name FROM intra.attendance_employees WHERE id=? AND archived_at IS NOT NULL AND NOT active",
