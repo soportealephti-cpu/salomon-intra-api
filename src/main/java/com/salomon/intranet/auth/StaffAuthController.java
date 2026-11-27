@@ -68,7 +68,7 @@ public class StaffAuthController {
         byte[] bytes = new byte[32];
         random.nextBytes(bytes);
         String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-        jdbc.update("INSERT INTO intra.staff_sessions (token_hash, user_id, expires_at) VALUES (?, ?, now() + interval '8 hours')",
+        jdbc.update("INSERT INTO intra.staff_sessions (token_hash, user_id, expires_at) VALUES (?, ?, now() + interval '24 hours')",
                     hash(token), user.id());
         return new LoginResult(token, new StaffUser(user.id(), user.username(), user.name(), user.role()));
     }
@@ -85,6 +85,25 @@ public class StaffAuthController {
                 rs.getString(3), rs.getString(4)), hash(token));
         if (found.isEmpty()) throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Sesión no válida");
         return found.get(0);
+    }
+
+    /**
+     * Renew an existing, unexpired opaque session without issuing another credential.
+     * Called only through the authenticated frontend. Never revive revoked or expired sessions.
+     * A five-minute write threshold avoids rewriting the session on every attendance poll.
+     */
+    @PostMapping("/renew")
+    public StaffUser renew(@RequestHeader(value = "Authorization", required = false) String authorization) {
+        String tokenHash = hash(bearer(authorization));
+        jdbc.update("""
+            UPDATE intra.staff_sessions s
+            SET expires_at = LEAST(now() + interval '24 hours', s.created_at + interval '7 days')
+            WHERE s.token_hash = ? AND s.expires_at > now()
+              AND s.created_at + interval '7 days' > now()
+              AND s.expires_at < LEAST(now() + interval '23 hours 55 minutes', s.created_at + interval '7 days')
+              AND EXISTS (SELECT 1 FROM intra.staff_users u WHERE u.id = s.user_id AND u.active)
+            """, tokenHash);
+        return me(authorization);
     }
 
     @PostMapping("/logout")
