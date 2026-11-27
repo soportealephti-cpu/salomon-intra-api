@@ -203,8 +203,6 @@ public class AttendanceController {
         if(input==null||input.date()==null||input.employeeId()<1||
             input.date().isBefore(LocalDate.of(2000,1,1))||input.date().isAfter(LocalDate.now(LIMA)))
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Fecha o trabajador inválido");
-        if("RECEPCION".equals(viewer.role())&&!input.date().equals(LocalDate.now(LIMA)))
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo registra salidas de hoy");
         if(input.returnObservation()!=null&&input.returnObservation().length()>1000)
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Observación demasiado extensa");
         var locked=jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active AND archived_at IS NULL FOR UPDATE",
@@ -282,9 +280,6 @@ public class AttendanceController {
             input.date().isBefore(LocalDate.of(2000,1,1)) || input.date().isAfter(LocalDate.now(LIMA))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Observación inválida");
         }
-        if ("RECEPCION".equals(viewer.role()) && !input.date().equals(LocalDate.now(LIMA))) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo edita observaciones de hoy");
-        }
         var locked = jdbc.query("SELECT id FROM intra.attendance_employees WHERE id=? AND active FOR UPDATE",
             (rs,i)->rs.getLong(1), input.employeeId());
         if (locked.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Trabajador no encontrado");
@@ -347,10 +342,6 @@ public class AttendanceController {
             !java.util.Set.of("ENTRY","EXIT","LUNCH_OUT","LUNCH_RETURN").contains(input.field()) ||
             input.date().isBefore(LocalDate.of(2000,1,1)) || input.date().isAfter(LocalDate.now(LIMA))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Datos de corrección inválidos");
-        }
-        boolean reception = "RECEPCION".equals(viewer.role());
-        if (reception && !input.date().equals(LocalDate.now(LIMA))) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica las horas del día actual");
         }
         final LocalTime time;
         try { time = "CLEAR".equals(action)?null:LocalTime.parse(input.time()); }
@@ -435,8 +426,6 @@ public class AttendanceController {
             input.reason().strip().length()<5||input.reason().length()>350||
             input.date().isBefore(LocalDate.of(2000,1,1))||input.date().isAfter(LocalDate.now(LIMA)))
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Datos de reordenamiento inválidos");
-        if("RECEPCION".equals(viewer.role())&&!input.date().equals(LocalDate.now(LIMA)))
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"Recepción solo modifica el día actual");
         LocalTime expected;
         try{expected=LocalTime.parse(input.expectedTime());}
         catch(java.time.DateTimeException ex){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Hora inválida");}
