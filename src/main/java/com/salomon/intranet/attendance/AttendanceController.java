@@ -193,7 +193,7 @@ public class AttendanceController {
                 var entry=LocalTime.parse(resolved.entryTime());
                 var alert=scheduled.alert();
                 if(alert==null&&!day.isBefore(LocalDate.of(2026,11,26))){
-                    alert=scheduled.start().plusMinutes(15);
+                    alert=scheduled.start().plusMinutes(1);
                     if(alert.isBefore(scheduled.start())||!alert.isBefore(scheduled.end()))alert=scheduled.start();
                 }
                 late=scheduled.working()&&!excused.contains(e.userId())&&

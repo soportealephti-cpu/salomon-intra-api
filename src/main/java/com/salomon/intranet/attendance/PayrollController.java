@@ -77,7 +77,7 @@ public class PayrollController {
             if(d==null||d.weekday()<1||d.weekday()>7||!weekdays.add(d.weekday()))throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
             LocalTime start,end,alert;
             try{start=LocalTime.parse(d.startsAt());end=LocalTime.parse(d.endsAt());
-                alert=d.alertFrom()==null||d.alertFrom().isBlank()?start.plusMinutes(15):LocalTime.parse(d.alertFrom());}
+                alert=d.alertFrom()==null||d.alertFrom().isBlank()?start.plusMinutes(1):LocalTime.parse(d.alertFrom());}
             catch(RuntimeException ex){throw new ResponseStatusException(HttpStatus.BAD_REQUEST);}
             if(!end.isAfter(start)||alert.isBefore(start)||!alert.isBefore(end))throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"La alerta debe estar entre el inicio y el fin de jornada");
             if(in.employeeId()==0){
