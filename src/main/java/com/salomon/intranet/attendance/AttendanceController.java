@@ -3,6 +3,8 @@ package com.salomon.intranet.attendance;
 import com.salomon.intranet.auth.StaffAuthController;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
+import java.util.HashSet;
+import java.util.Set;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -147,17 +149,27 @@ public class AttendanceController {
                         rs.getString("actor_username"),rs.getString("created_at")));
             }, day);
         // Use only effective schedules for this date. No invented default start time.
-        Map<Long,LocalTime> scheduledStarts=new HashMap<>();
+        record WorkSchedule(LocalTime start,LocalTime end,LocalTime alert,boolean working){}
+        Map<Long,WorkSchedule> scheduledStarts=new HashMap<>();
         jdbc.query("""
-            SELECT employee_id,starts_at,working FROM (
-                SELECT DISTINCT ON (employee_id) employee_id,starts_at,working
-                FROM intra.payroll_schedules
-                WHERE effective_from<=? AND weekday=?
-                ORDER BY employee_id,effective_from DESC
+            SELECT DISTINCT ON (employee_id) employee_id,starts_at,ends_at,alert_from,working
+            FROM (
+                SELECT employee_id,effective_from,starts_at,ends_at,alert_from,working
+                FROM intra.payroll_schedules WHERE effective_from<=? AND weekday=?
+                UNION ALL
+                SELECT 0,effective_from,starts_at,ends_at,alert_from,working
+                FROM intra.payroll_default_schedules WHERE effective_from<=? AND weekday=?
             ) effective_schedule
+            ORDER BY employee_id,effective_from DESC
             """,rs->{
-                if(rs.getBoolean("working"))scheduledStarts.put(rs.getLong("employee_id"),rs.getObject("starts_at",LocalTime.class));
-            },day,day.getDayOfWeek().getValue());
+                scheduledStarts.put(rs.getLong("employee_id"),new WorkSchedule(rs.getObject("starts_at",LocalTime.class),rs.getObject("ends_at",LocalTime.class),rs.getObject("alert_from",LocalTime.class),rs.getBoolean("working")));
+            },day,day.getDayOfWeek().getValue(),day,day.getDayOfWeek().getValue());
+        Set<Long> excused=new HashSet<>(jdbc.query("""
+            SELECT employee_id FROM (
+                SELECT DISTINCT ON(employee_id) employee_id,kind FROM intra.payroll_incidents WHERE work_date=?
+                ORDER BY employee_id,id DESC
+            ) latest WHERE kind<>'NONE'
+            """,(rs,i)->rs.getLong(1),day));
         Map<Long,List<TemporaryOuting>> outings=new HashMap<>();
         jdbc.query("""
             SELECT employee_id,id,to_char(departure,'HH24:MI:SS') AS departure,
@@ -175,8 +187,18 @@ public class AttendanceController {
             var adjustments = manual.getOrDefault(e.userId(), Map.of());
             var changes=history.getOrDefault(e.userId(),List.of());
             var resolved=resolve(day,e.punches(),adjustments,changes);
-            var scheduled=scheduledStarts.get(e.userId());
-            Boolean late=scheduled==null||resolved.entryTime()==null?null:LocalTime.parse(resolved.entryTime()).isAfter(scheduled);
+            var scheduled=scheduledStarts.getOrDefault(e.userId(),scheduledStarts.get(0L));
+            Boolean late=null;
+            if(scheduled!=null&&resolved.entryTime()!=null){
+                var entry=LocalTime.parse(resolved.entryTime());
+                var alert=scheduled.alert();
+                if(alert==null&&!day.isBefore(LocalDate.of(2026,11,26))){
+                    alert=scheduled.start().plusMinutes(15);
+                    if(alert.isBefore(scheduled.start())||!alert.isBefore(scheduled.end()))alert=scheduled.start();
+                }
+                late=scheduled.working()&&!excused.contains(e.userId())&&
+                    (alert==null?entry.isAfter(scheduled.start()):!entry.isBefore(alert));
+            }
             return new AttendanceRow(e.userId(), e.employeeCode(), e.fullName(), e.area(), e.company(), e.dni(),
                 e.punches(),resolved,adjustments,observations.getOrDefault(e.userId(),Map.of()),changes,late,outings.getOrDefault(e.userId(),List.of()));
         }).toList();
