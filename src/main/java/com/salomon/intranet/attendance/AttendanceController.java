@@ -172,16 +172,26 @@ public class AttendanceController {
             """,(rs,i)->rs.getLong(1),day));
         Map<Long,List<TemporaryOuting>> outings=new HashMap<>();
         jdbc.query("""
-            SELECT employee_id,id,to_char(departure,'HH24:MI:SS') AS departure,
-                   to_char(return_time,'HH24:MI:SS') AS return_time,observation,
-                   actor_username,created_at::text AS created_at,
-                   return_actor_username,returned_at::text AS returned_at,return_observation
-            FROM intra.attendance_outings WHERE work_date=? ORDER BY departure,id
+            SELECT o.employee_id,o.id,to_char(o.departure,'HH24:MI:SS') AS departure,
+                   to_char(o.return_time,'HH24:MI:SS') AS return_time,o.observation,
+                   o.actor_username,o.created_at::text AS created_at,
+                   o.return_actor_username,o.returned_at::text AS returned_at,o.return_observation,
+                   o.void_action,o.void_reason,o.void_actor_username,o.voided_at::text,
+                   dest.full_name AS moved_to,child.work_date::text AS moved_date,
+                   src.full_name AS moved_from,parent.work_date::text AS moved_from_date,parent.void_reason AS moved_from_reason
+            FROM intra.attendance_outings o
+            LEFT JOIN intra.attendance_outings child ON child.replaces_id=o.id
+            LEFT JOIN intra.attendance_employees dest ON dest.id=child.employee_id
+            LEFT JOIN intra.attendance_outings parent ON parent.id=o.replaces_id
+            LEFT JOIN intra.attendance_employees src ON src.id=parent.employee_id
+            WHERE o.work_date=? ORDER BY o.departure,o.id
             """,rs->{
                 outings.computeIfAbsent(rs.getLong("employee_id"),k->new java.util.ArrayList<>())
                     .add(new TemporaryOuting(rs.getLong("id"),rs.getString("departure"),rs.getString("return_time"),
                         rs.getString("observation"),rs.getString("actor_username"),rs.getString("created_at"),
-                        rs.getString("return_actor_username"),rs.getString("returned_at"),rs.getString("return_observation")));
+                        rs.getString("return_actor_username"),rs.getString("returned_at"),rs.getString("return_observation"),
+                        rs.getString("void_action"),rs.getString("void_reason"),rs.getString("void_actor_username"),rs.getString("voided_at"),
+                        rs.getString("moved_to"),rs.getString("moved_date"),rs.getString("moved_from"),rs.getString("moved_from_date"),rs.getString("moved_from_reason")));
             },day);
         employees = employees.stream().map(e -> {
             var adjustments = manual.getOrDefault(e.userId(), Map.of());
@@ -209,7 +219,9 @@ public class AttendanceController {
     }
 
     public record TemporaryOuting(long id,String departure,String returnTime,String observation,
-                                  String actor,String createdAt,String returnActor,String returnedAt,String returnObservation) {}
+                                  String actor,String createdAt,String returnActor,String returnedAt,String returnObservation,
+                                  String voidAction,String voidReason,String voidActor,String voidedAt,
+                                  String movedTo,String movedDate,String movedFrom,String movedFromDate,String movedFromReason) {}
     public record OutingInput(long employeeId,LocalDate date,Long outingId,String departure,
                               String returnTime,String observation,String returnObservation) {}
 
@@ -237,14 +249,14 @@ public class AttendanceController {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Indica la hora de regreso");
             var rows=jdbc.query("""
                 SELECT departure FROM intra.attendance_outings
-                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL
+                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL AND voided_at IS NULL
                 """,(rs,i)->rs.getObject(1,LocalTime.class),input.outingId(),input.employeeId(),input.date());
             if(rows.isEmpty())throw new ResponseStatusException(HttpStatus.CONFLICT,"Salida no disponible o ya cerrada");
             if(!back.isAfter(rows.getFirst()))throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"El regreso debe ser posterior a la salida");
             if(jdbc.update("""
                 UPDATE intra.attendance_outings SET return_time=?,return_actor_id=?,return_actor_username=?,
                     returned_at=now(),return_observation=?
-                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL
+                WHERE id=? AND employee_id=? AND work_date=? AND return_time IS NULL AND voided_at IS NULL
                 """,java.sql.Time.valueOf(back),viewer.id(),viewer.username(),returnNote,input.outingId(),input.employeeId(),input.date())!=1)
                 throw new ResponseStatusException(HttpStatus.CONFLICT,"La salida ya fue cerrada");
             return Map.of("saved",true);
@@ -255,7 +267,7 @@ public class AttendanceController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Indica salida, motivo y un regreso posterior, si corresponde");
         var overlap=jdbc.queryForObject("""
             SELECT EXISTS(SELECT 1 FROM intra.attendance_outings
-                WHERE employee_id=? AND work_date=?
+                WHERE employee_id=? AND work_date=? AND voided_at IS NULL
                   AND departure < COALESCE(CAST(? AS time),time '24:00')
                   AND COALESCE(return_time,time '24:00') > CAST(? AS time))
             """,Boolean.class,input.employeeId(),input.date(),back==null?null:java.sql.Time.valueOf(back),java.sql.Time.valueOf(departure));
@@ -275,6 +287,85 @@ public class AttendanceController {
         }
         return Map.of("saved",true);
     }
+
+    public record OutingCorrection(long employeeId,LocalDate date,long outingId,String action,String reason,
+        String expectedDeparture,String expectedReturnTime,Long targetEmployeeId,LocalDate targetDate,
+        String departure,String returnTime) {}
+    private record OutingSnapshot(LocalTime departure,LocalTime back,String observation,String returnNote) {}
+
+    @PostMapping("/outings/correct")
+    @Transactional
+    public Map<String,Object> correctOuting(@RequestHeader(value="Authorization",required=false) String authorization,
+        @RequestBody OutingCorrection in){
+        var viewer=auth.me(authorization);
+        if(!java.util.Set.of("SA","ADMIN","RECEPCION").contains(viewer.role()))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN,"No autorizado a corregir salidas");
+        var today=LocalDate.now(LIMA);
+        if(in==null||in.employeeId()<1||in.outingId()<1||in.date()==null||
+            in.date().isBefore(LocalDate.of(2000,1,1))||in.date().isAfter(today)||in.action()==null||
+            !java.util.Set.of("DELETE","MOVE").contains(in.action())||in.reason()==null||
+            in.reason().strip().length()<3||in.reason().length()>500)
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Indica una salida y un motivo válido");
+        boolean move="MOVE".equals(in.action());
+        long target=move&&in.targetEmployeeId()!=null?in.targetEmployeeId():in.employeeId();
+        LocalDate date=move?in.targetDate():in.date();
+        if(target<1||date==null||date.isBefore(LocalDate.of(2000,1,1))||date.isAfter(today))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Destino inválido");
+        // Serialize against ordinary departure/return operations and other corrections.
+        var locks=jdbc.query("SELECT id FROM intra.attendance_employees WHERE id IN (?,?) ORDER BY id FOR UPDATE",
+            (rs,i)->rs.getLong(1),in.employeeId(),target);
+        if(!locks.contains(in.employeeId())||!locks.contains(target))
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND,"Trabajador no encontrado");
+        var rows=jdbc.query("""
+            SELECT departure,return_time,observation,return_observation FROM intra.attendance_outings
+            WHERE id=? AND employee_id=? AND work_date=? AND voided_at IS NULL FOR UPDATE
+            """,(rs,i)->new OutingSnapshot(rs.getObject(1,LocalTime.class),rs.getObject(2,LocalTime.class),
+                rs.getString(3),rs.getString(4)),in.outingId(),in.employeeId(),in.date());
+        if(rows.isEmpty())throw new ResponseStatusException(HttpStatus.CONFLICT,"La salida ya fue modificada");
+        var original=rows.getFirst();
+        if(!java.util.Objects.equals(original.departure(),parseOutingTime(in.expectedDeparture(),in.date()))||
+           !java.util.Objects.equals(original.back(),parseOutingTime(in.expectedReturnTime(),in.date())))
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"Las horas cambiaron; actualiza el historial");
+        LocalTime departure=null,back=null;
+        if(move){
+            if(!Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM intra.attendance_employees WHERE id=? AND active AND archived_at IS NULL)",Boolean.class,target)))
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"El trabajador de destino no está activo");
+            departure=parseOutingTime(in.departure(),date);back=parseOutingTime(in.returnTime(),date);
+            if(departure==null||(back!=null&&!back.isAfter(departure)))
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Las horas de salida y regreso no son válidas");
+            if(target==in.employeeId()&&date.equals(in.date())&&departure.equals(original.departure())&&java.util.Objects.equals(back,original.back()))
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"No hay cambios para reordenar");
+            if(Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM intra.attendance_outings
+                WHERE employee_id=? AND work_date=? AND voided_at IS NULL AND id<>?
+                AND departure<COALESCE(CAST(? AS time),time '24:00')
+                AND COALESCE(return_time,time '24:00')>CAST(? AS time))
+                """,Boolean.class,target,date,in.outingId(),back==null?null:java.sql.Time.valueOf(back),java.sql.Time.valueOf(departure))))
+                throw new ResponseStatusException(HttpStatus.CONFLICT,"El destino tiene otra salida en ese horario");
+        }
+        if(jdbc.update("""
+            UPDATE intra.attendance_outings SET voided_at=now(),void_action=?,void_reason=?,void_actor_id=?,void_actor_username=?
+            WHERE id=? AND voided_at IS NULL
+            """,move?"MOVED":"DELETED",in.reason().strip(),viewer.id(),viewer.username(),in.outingId())!=1)
+            throw new ResponseStatusException(HttpStatus.CONFLICT,"La salida ya fue modificada");
+        if(move){
+            if(back==null){
+                jdbc.update("""
+                    INSERT INTO intra.attendance_outings(employee_id,work_date,departure,observation,actor_id,actor_username,replaces_id)
+                    VALUES (?,?,?,?,?,?,?)
+                    """,target,date,java.sql.Time.valueOf(departure),original.observation(),viewer.id(),viewer.username(),in.outingId());
+            }else{
+                jdbc.update("""
+                    INSERT INTO intra.attendance_outings(employee_id,work_date,departure,observation,actor_id,actor_username,
+                        return_time,return_actor_id,return_actor_username,returned_at,return_observation,replaces_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,now(),?,?)
+                    """,target,date,java.sql.Time.valueOf(departure),original.observation(),viewer.id(),viewer.username(),
+                    java.sql.Time.valueOf(back),viewer.id(),viewer.username(),original.returnNote(),in.outingId());
+            }
+        }
+        return Map.of("saved",true);
+    }
+
     private static LocalTime parseOutingTime(String value,LocalDate day){
         if(value==null||value.isBlank())return null;
         LocalTime time;
